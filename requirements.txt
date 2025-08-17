@@ -1,0 +1,10 @@
+streamlit
+langchain
+chromadb
+sentence-transformers
+librosa
+numpy
+scipy
+soundfile
+pyloudnorm
+torch
