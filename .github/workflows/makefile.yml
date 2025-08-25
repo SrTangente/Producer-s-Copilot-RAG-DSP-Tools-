@@ -16,15 +16,6 @@ jobs:
       - name: Install autotools (Ubuntu)
         run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool
 
-      - name: Generate configure
-        run: |
-          autoreconf -i
-          ./configure
-          make -j$(nproc)
-
-      - name: configure
-        run: ./configure
-
       - name: Install dependencies
         run: make
 
