@@ -8,3 +8,4 @@ scipy
 soundfile
 pyloudnorm
 torch
+pylint
