@@ -1,0 +1,90 @@
+# cloudbuild.yaml
+options:
+  logging: CLOUD_LOGGING_ONLY
+  substitutionOption: ALLOW_LOOSE
+
+substitutions:
+  _REGION: "europe-west1"
+  _REPO: "app-containers"
+  _SERVICE: "myapp"
+  _RUN_LOAD_TESTS: "false" 
+
+images:
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:${SHORT_SHA}"
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest"
+
+steps:
+  # Build
+  - name: "gcr.io/cloud-builders/docker"
+    id: "Build image"
+    args:
+      - "build"
+      - "-t"
+      - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:${SHORT_SHA}"
+      - "-t"
+      - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest"
+      - "."
+
+  # Push
+  - name: "gcr.io/cloud-builders/docker"
+    id: "Push (SHA)"
+    args: ["push", "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:${SHORT_SHA}"]
+
+  - name: "gcr.io/cloud-builders/docker"
+    id: "Push (latest)"
+    args: ["push", "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest"]
+
+  # (Opcional) Deploy a Cloud Run (staging)
+  - name: "gcr.io/cloud-builders/gcloud"
+    id: "Deploy to Cloud Run (staging)"
+    entrypoint: bash
+    args:
+      - -lc
+      - |
+        if [ "${_RUN_LOAD_TESTS}" = "true" ]; then
+          gcloud run deploy ${_SERVICE}-staging \
+            --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:${SHORT_SHA} \
+            --region=${_REGION} --platform=managed --allow-unauthenticated
+        else
+          echo "Skipping deploy (non-staging)"
+        fi
+
+  # Locust (solo en staging)
+  - name: "python:3.11-slim"
+    id: "Install Locust"
+    entrypoint: "bash"
+    args:
+      - -lc
+      - |
+        if [ "${_RUN_LOAD_TESTS}" = "true" ]; then
+          pip install --no-cache-dir -r tests/load/requirements.txt
+        else
+          echo "Skipping Locust install"
+        fi
+
+  - name: "python:3.11-slim"
+    id: "Run Locust"
+    entrypoint: "bash"
+    secretEnv: ["LOCUST_TARGET_URL"]
+    args:
+      - -lc
+      - |
+        if [ "${_RUN_LOAD_TESTS}" = "true" ]; then
+          pip install --no-cache-dir -r tests/load/requirements.txt
+          # Fallar el build si hay errores de requests:
+          locust -f tests/load/locustfile.py \
+            --headless \
+            --host "$LOCUST_TARGET_URL" \
+            --users 25 \
+            --spawn-rate 5 \
+            --run-time 2m \
+            --stop-timeout 30 \
+            --exit-code-on-error
+        else
+          echo "Skipping Locust run"
+        fi
+
+availableSecrets:
+  secretManager:
+    - versionName: "projects/$PROJECT_ID/secrets/LOCUST_TARGET_URL/versions/latest"
+      env: "LOCUST_TARGET_URL"
