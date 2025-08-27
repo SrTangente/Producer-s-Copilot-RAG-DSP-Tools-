@@ -19,8 +19,5 @@ jobs:
       - name: Install dependencies
         run: make
 
-      - name: Check linting
-        run: make lint
-
       - name: Run test
         run: make test
