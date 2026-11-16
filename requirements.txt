@@ -1,11 +1,11 @@
-streamlit
-langchain
-chromadb
-sentence-transformers
-librosa
-numpy
-scipy
-soundfile
-pyloudnorm
-torch
-pylint
+# Runtime
+fastapi==0.163.1
+uvicorn[standard]==0.54.0
+python-multipart==0.0.34
+numpy==2.5.5
+scipy==1.18.1
+librosa==1.0.1
+soundfile==0.14.0
+pyloudnorm==0.2.0
+scikit-learn==1.9.1
+anthropic==2.9.0

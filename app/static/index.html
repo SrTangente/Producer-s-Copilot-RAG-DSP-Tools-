@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Producer's Copilot</title>
+<meta name="description" content="Analyze your mix, compare it with references and get production tips.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23f2a93b'/%3E%3Cpath d='M7 20v-4M12 23V9M17 20v-8M22 25V7M27 19v-2' stroke='%231a1612' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" class="logo-bg"/><path d="M7 20v-4M12 23V9M17 20v-8M22 25V7M27 19v-2" class="logo-bars"/></svg>
+    <div>
+      <h1>Producer's Copilot</h1>
+      <p class="tagline">Measure your mix, compare it with a reference, get tips you can act on.</p>
+    </div>
+  </div>
+  <span id="engine" class="pill" title="How tips are written">…</span>
+</header>
+
+<main>
+  <section class="panel setup" aria-labelledby="setup-h">
+    <h2 id="setup-h">1 · Your track</h2>
+    <label id="drop" class="drop" tabindex="0">
+      <input id="mix-file" type="file" accept=".wav,.flac,.aif,.aiff,.ogg,.mp3,.m4a,audio/*" hidden>
+      <span class="drop-icon" aria-hidden="true">⤒</span>
+      <span id="drop-text"><strong>Drop a mix or master</strong> or click to choose<br><small>WAV, FLAC, AIFF, MP3, OGG, M4A · up to 60 MB</small></span>
+    </label>
+
+    <h2>2 · Compare with</h2>
+    <div class="seg" role="radiogroup" aria-label="Reference type">
+      <label><input type="radio" name="refmode" value="none" checked><span>Nothing</span></label>
+      <label><input type="radio" name="refmode" value="target"><span>Genre profile</span></label>
+      <label><input type="radio" name="refmode" value="reference"><span>My references</span></label>
+    </div>
+    <div id="target-box" class="refbox" hidden>
+      <select id="target-select" aria-label="Genre profile"></select>
+      <p id="target-desc" class="hint"></p>
+    </div>
+    <div id="reference-box" class="refbox" hidden>
+      <select id="reference-select" aria-label="Reference track"></select>
+      <p class="hint">Reference tracks compare tone and stereo width too. Add them below.</p>
+    </div>
+
+    <label id="llm-row" class="check" hidden><input id="use-llm" type="checkbox" checked> Write tips with Claude</label>
+    <button id="go" class="primary" disabled>Analyze track</button>
+    <p id="status" class="status" role="status" aria-live="polite"></p>
+
+    <details class="refs" id="refs-panel">
+      <summary>Reference library <span id="ref-count" class="count">0</span></summary>
+      <p class="hint">Upload commercial tracks you'd like your mix to sit next to. Only their measurements are stored, never the audio, and only this browser can see them.</p>
+      <form id="ref-form" class="ref-form">
+        <input id="ref-file" type="file" accept=".wav,.flac,.aif,.aiff,.ogg,.mp3,.m4a,audio/*" required aria-label="Reference audio file">
+        <input id="ref-name" type="text" placeholder="Name (optional)" maxlength="120" aria-label="Reference name">
+        <button type="submit" class="secondary">Add reference</button>
+      </form>
+      <ul id="ref-list" class="ref-list"></ul>
+    </details>
+  </section>
+
+  <section id="results" class="results" aria-live="polite">
+    <div class="empty">
+      <div class="wave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+      <p>Results appear here: loudness, peaks, dynamics, tonal balance, stereo image, tempo and key, followed by prioritised tips.</p>
+    </div>
+  </section>
+</main>
+
+<footer>
+  Measurements: ITU-R BS.1770 loudness, EBU R128 loudness range, 4× oversampled true peak. Tips are guidance: trust your ears.
+  · <a href="/docs">API docs</a>
+</footer>
+
+<template id="tpl-results">
+  <div class="summary-card">
+    <div class="summary-head">
+      <h2 class="file-name"></h2>
+      <span class="engine-tag"></span>
+    </div>
+    <p class="summary"></p>
+    <p class="llm-error" hidden></p>
+  </div>
+  <div class="tiles"></div>
+  <div class="grid2">
+    <div class="panel">
+      <h3>Tonal balance <small class="tb-note"></small></h3>
+      <div class="bands"></div>
+    </div>
+    <div class="panel comparison-panel">
+      <h3>Against <span class="ref-name"></span></h3>
+      <table class="cmp"><thead><tr><th>Metric</th><th>Mix</th><th>Ref</th><th>Δ</th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+  <h3 class="tips-h">Tips</h3>
+  <ol class="tips"></ol>
+  <details class="panel sources">
+    <summary>Knowledge used <span class="count src-count"></span></summary>
+    <div class="src-list"></div>
+  </details>
+</template>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
