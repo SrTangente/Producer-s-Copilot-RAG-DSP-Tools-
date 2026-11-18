@@ -1,10 +1,13 @@
-import librosa
 import numpy as np
 import pyloudnorm as pyln
 import pytest
 
 from app.tools import AudioLoadError, analyze_audio, loudness_range
 from tests.conftest import SR, drum_loop
+
+
+def tone(freq, seconds=2.0, sr=SR):
+    return np.sin(2 * np.pi * freq * np.arange(int(sr * seconds)) / sr)
 
 
 def test_bpm_detection(make_wav):
@@ -17,14 +20,14 @@ def test_bpm_detection(make_wav):
 
 
 def test_key_detection_major_chord(make_wav):
-    chord = sum(librosa.tone(f, sr=SR, length=SR * 2) for f in (261.63, 329.63, 392.0)) / 3
+    chord = sum(tone(f) for f in (261.63, 329.63, 392.0)) / 3
     metrics = analyze_audio(make_wav(chord))
     assert (metrics["key"], metrics["mode"]) == ("C", "major")
     assert metrics["key_confidence"] > 0.5
 
 
 def test_key_detection_minor_chord(make_wav):
-    chord = sum(librosa.tone(f, sr=SR, length=SR * 2) for f in (220.0, 261.63, 329.63)) / 3
+    chord = sum(tone(f) for f in (220.0, 261.63, 329.63)) / 3
     metrics = analyze_audio(make_wav(chord))
     assert (metrics["key"], metrics["mode"]) == ("A", "minor")
 
@@ -94,3 +97,25 @@ def test_garbage_file_raises(tmp_path):
     bad.write_bytes(b"not audio at all")
     with pytest.raises(AudioLoadError):
         analyze_audio(str(bad))
+
+
+def test_block_boundaries_do_not_change_results(make_wav, monkeypatch):
+    path = make_wav(drum_loop(seconds=12))
+    whole = analyze_audio(path)
+    monkeypatch.setattr("app.tools.BLOCK_FRAMES", 4097)
+    split = analyze_audio(path)
+    for key in ("lufs_i", "lra", "true_peak_dbfs", "stereo_width", "low_end_width", "bpm"):
+        assert split[key] == pytest.approx(whole[key], abs=0.02), key
+    assert split["clipped_samples"] == whole["clipped_samples"]
+
+
+def test_stereo_loudness_matches_reference_meter(make_wav):
+    y = drum_loop(seconds=10).astype(np.float64)
+    expected = pyln.Meter(SR).integrated_loudness(y)
+    assert analyze_audio(make_wav(y))["lufs_i"] == pytest.approx(expected, abs=0.05)
+
+
+def test_silence_and_very_short_clips_do_not_crash(make_wav):
+    silent = analyze_audio(make_wav(np.zeros(SR)))
+    assert silent["lufs_i"] == -70.0 and silent["bpm"] == 0.0
+    assert analyze_audio(make_wav(0.5 * tone(440, 0.05)))["duration_s"] == pytest.approx(0.05, abs=0.001)

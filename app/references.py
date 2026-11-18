@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import threading
 import time
@@ -65,6 +66,7 @@ GENRE_TARGETS: dict[str, dict] = {
 }
 
 MAX_REFERENCES_PER_WORKSPACE = 20
+MAX_CLIENT_REFERENCE_CHARS = 20_000
 _WORKSPACE_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 
@@ -123,6 +125,37 @@ class ReferenceStore:
             if removed:
                 self._save(data)
         return removed is not None
+
+
+def parse_client_reference(raw: str) -> dict:
+    """Validate reference metrics sent by the browser, keeping known numbers only."""
+    if len(raw) > MAX_CLIENT_REFERENCE_CHARS:
+        raise ValueError("Reference data is too large")
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("Reference data must be an object")
+
+    def number(value) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value) if math.isfinite(value) else None
+
+    clean: dict = {}
+    for key, *_ in COMPARED_METRICS:
+        value = number(data.get(key))
+        if value is not None:
+            clean[key] = value
+    bands = data.get("band_level_db")
+    if isinstance(bands, dict):
+        levels = {band: number(bands.get(band)) for band in BAND_LABELS}
+        clean["band_level_db"] = {k: v for k, v in levels.items() if v is not None}
+    if not clean:
+        raise ValueError("Reference data has no usable metrics")
+    return clean
+
+
+def clean_reference_name(name: str | None) -> str:
+    return re.sub(r"[<>\"\x00-\x1f]", "", name or "").strip()[:120] or "your reference"
 
 
 def compare(metrics: dict, reference: dict) -> list[dict]:

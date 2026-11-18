@@ -1,6 +1,8 @@
 """Producer's Copilot HTTP API and web UI."""
 from __future__ import annotations
 
+import gc
+import json
 import logging
 import os
 import tempfile
@@ -13,8 +15,9 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadF
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .knowledge import KnowledgeBase
-from .references import GENRE_TARGETS, ReferenceStore, compare, valid_workspace
+from .knowledge import KnowledgeBase, load_chunks
+from .references import (GENRE_TARGETS, ReferenceStore, clean_reference_name, compare,
+                         parse_client_reference, valid_workspace)
 from .tips import ClaudeTipWriter, generate_tips
 from .tools import AudioLoadError, analyze_audio
 
@@ -62,7 +65,10 @@ def create_app(*, store: ReferenceStore | None = None, kb: KnowledgeBase | None 
     api = FastAPI(title="Producer's Copilot API", version="1.0.0",
                   description="DSP analysis, reference comparison and RAG production tips for your mixes.")
     api.state.store = store or ReferenceStore(_default_data_dir() / "references.json")
-    api.state.kb = kb or KnowledgeBase()
+    api.state.kb = kb  # built on first use: it is slow to create on a small instance
+    api.state.kb_lock = threading.Lock()
+    # One analysis at a time keeps memory bounded; other requests wait their turn
+    api.state.analysis_slot = threading.BoundedSemaphore(1)
     if writer is True:
         writer = ClaudeTipWriter() if os.environ.get("ANTHROPIC_API_KEY") else None
     api.state.writer = writer or None
@@ -87,19 +93,35 @@ def create_app(*, store: ReferenceStore | None = None, kb: KnowledgeBase | None 
                 tmp.write(chunk)
             path = tmp.name
         try:
-            return analyze_audio(path)
+            with api.state.analysis_slot:
+                try:
+                    return analyze_audio(path)
+                finally:
+                    gc.collect()
         except AudioLoadError as exc:
             raise HTTPException(422, str(exc)) from exc
         finally:
             os.unlink(path)
+
+    def knowledge_base() -> KnowledgeBase:
+        with api.state.kb_lock:
+            if api.state.kb is None:
+                api.state.kb = KnowledgeBase()
+            return api.state.kb
 
     def require_workspace(workspace: str | None) -> str:
         if not valid_workspace(workspace):
             raise HTTPException(400, "Missing or invalid X-Workspace header")
         return workspace
 
-    def resolve_reference(workspace: str | None, reference_id: str | None,
-                          target_id: str | None) -> tuple[dict | None, str | None]:
+    def resolve_reference(workspace: str | None, reference_id: str | None, target_id: str | None,
+                          reference_json: str | None, reference_name: str | None,
+                          ) -> tuple[dict | None, str | None]:
+        if reference_json:
+            try:
+                return parse_client_reference(reference_json), clean_reference_name(reference_name)
+            except (ValueError, json.JSONDecodeError) as exc:
+                raise HTTPException(422, f"Invalid reference data: {exc}") from exc
         if reference_id:
             ref = api.state.store.get(require_workspace(workspace), reference_id)
             if not ref:
@@ -117,7 +139,7 @@ def create_app(*, store: ReferenceStore | None = None, kb: KnowledgeBase | None 
     @api.get("/health")
     def health():
         return {"status": "ok", "tip_engine": "claude" if api.state.writer else "rules",
-                "knowledge_chunks": len(api.state.kb.chunks)}
+                "knowledge_chunks": len(load_chunks())}
 
     @api.post("/analyze")
     def analyze(file: UploadFile = File(...)):
@@ -152,10 +174,12 @@ def create_app(*, store: ReferenceStore | None = None, kb: KnowledgeBase | None 
     @api.post("/tips")
     def production_tips(request: Request, file: UploadFile = File(...),
                         reference_id: str | None = Form(None), target_id: str | None = Form(None),
+                        reference_json: str | None = Form(None), reference_name: str | None = Form(None),
                         use_llm: bool = Form(True), x_workspace: str | None = Header(None)):
         """Analyze a track, compare it with a reference or genre profile, and
         return production tips grounded in the knowledge base."""
-        reference, reference_name = resolve_reference(x_workspace, reference_id or None, target_id or None)
+        reference, label = resolve_reference(x_workspace, reference_id or None, target_id or None,
+                                             reference_json or None, reference_name)
         metrics = analyze_upload(file)
         comparison = compare(metrics, reference) if reference else []
 
@@ -167,11 +191,11 @@ def create_app(*, store: ReferenceStore | None = None, kb: KnowledgeBase | None 
             if not api.state.llm_limiter.allow(client_ip):
                 writer, rate_limited = None, True
 
-        result = generate_tips(metrics, api.state.kb, reference=reference, reference_name=reference_name,
+        result = generate_tips(metrics, knowledge_base(), reference=reference, reference_name=label,
                                comparison=comparison, writer=writer)
         if rate_limited:
             result["llm_error"] = "Hourly limit for AI-written tips reached; showing rule-based tips."
-        return {"metrics": metrics, "reference_name": reference_name, "comparison": comparison, **result}
+        return {"metrics": metrics, "reference_name": label, "comparison": comparison, **result}
 
     # --- web UI ------------------------------------------------------------
 

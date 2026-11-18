@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
 
 KNOWLEDGE_DIR = Path(__file__).parent / "knowledge"
 
@@ -47,6 +46,9 @@ def load_chunks(directory: Path = KNOWLEDGE_DIR) -> list[Chunk]:
 
 class KnowledgeBase:
     def __init__(self, chunks: list[Chunk] | None = None):
+        # Imported here so the server starts quickly on a small instance
+        from sklearn.feature_extraction.text import TfidfVectorizer  # pylint: disable=import-outside-toplevel
+
         self.chunks = chunks if chunks is not None else load_chunks()
         if not self.chunks:
             raise ValueError("Knowledge base is empty")

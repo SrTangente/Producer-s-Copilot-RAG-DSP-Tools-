@@ -1,4 +1,5 @@
 import io
+import json
 
 import pytest
 import soundfile as sf
@@ -75,6 +76,24 @@ def test_tips_with_uploaded_reference(client, loop_wav):
     assert body["reference_name"] == "ref"
     assert any(f["id"] == "quieter_than_ref" for f in body["findings"])
     assert body["comparison"] and body["tips"] and body["sources"]
+
+
+def test_tips_with_reference_held_by_the_browser(client, loop_wav):
+    metrics = client.post("/analyze", files=upload(loop_wav)).json()
+    quiet = wav_bytes(drum_loop(seconds=6, gain=0.08))
+    r = client.post("/tips", files=upload(quiet),
+                    data={"reference_json": json.dumps(metrics), "reference_name": 'My <ref>"'})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["reference_name"] == "My ref"
+    assert any(f["id"] == "quieter_than_ref" for f in body["findings"])
+    assert any(row["metric"] == "band_level_db.sub" for row in body["comparison"])
+
+
+@pytest.mark.parametrize("bad", ["not json", "[1, 2]", "{}", '{"lufs_i": "loud"}', '{"lufs_i": 1e999}'])
+def test_tips_rejects_bad_reference_data(client, loop_wav, bad):
+    r = client.post("/tips", files=upload(loop_wav), data={"reference_json": bad})
+    assert r.status_code == 422
 
 
 def test_tips_with_genre_target(client, loop_wav):

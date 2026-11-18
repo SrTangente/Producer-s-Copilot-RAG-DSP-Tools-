@@ -1,14 +1,3 @@
----
-title: Producer's Copilot
-emoji: 🎛️
-colorFrom: yellow
-colorTo: gray
-sdk: docker
-app_port: 7860
-pinned: false
-short_description: Analyze a mix, compare it with references, get tips.
----
-
 # Producer's Copilot
 
 Upload a mix or master and get:
@@ -32,7 +21,7 @@ audio ──► DSP analysis (app/tools.py)
                             └─ falls back to rule-based tips if no key / API error
 ```
 
-Reference tracks are stored as measurements only (never audio), scoped to a random workspace id kept in the browser.
+The audio is read block by block, and only the middle two minutes are held in memory for tempo and key, so the app fits on a 512 MB instance. In the web app, reference tracks are kept as measurements in the browser; the audio is never stored.
 
 ## Run locally
 
@@ -53,7 +42,7 @@ Tests and lint: `make test`, `make lint`. Docker: `make docker` (serves on port 
 | `COPILOT_MODEL` | `claude-opus-5-5` | Model used for tips |
 | `LLM_RATE_LIMIT_PER_HOUR` | `20` | AI-tip requests per client IP per hour |
 | `MAX_UPLOAD_MB` | `60` | Upload size limit |
-| `DATA_DIR` | `/data` if writable, else `./data` | Where reference metrics are stored |
+| `DATA_DIR` | `/data` if writable, else `./data` | Where the `/references` API stores metrics |
 
 ## API
 
@@ -62,22 +51,21 @@ Interactive docs at `/docs`.
 | Method | Path | |
 |---|---|---|
 | `POST` | `/analyze` | Multipart `file` → metrics |
-| `POST` | `/tips` | Multipart `file`, optional `reference_id` or `target_id`, `use_llm` → metrics, comparison, findings, tips, sources |
+| `POST` | `/tips` | Multipart `file`, optional `target_id`, `reference_id` or `reference_json` + `reference_name`, and `use_llm` → metrics, comparison, findings, tips, sources |
 | `GET` | `/targets` | Built-in genre profiles |
 | `POST` / `GET` | `/references` | Add / list reference tracks (header `X-Workspace`) |
 | `DELETE` | `/references/{id}` | Remove a reference |
 | `GET` | `/health` | Status and active tip engine |
 
-## Deploy to Hugging Face Spaces
+## Deploy for free on Render
 
-The repository is a ready-made Docker Space (see the YAML header above).
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/SrTangente/Producer-s-Copilot-RAG-DSP-Tools-)
 
-1. Create a Space with the **Docker** SDK, then push this repo to it:
-   `git push https://huggingface.co/spaces/<user>/<space> main`
-2. In the Space settings, add the secret `ANTHROPIC_API_KEY` to enable AI tips.
-3. Optional: enable persistent storage so reference libraries survive restarts (the app uses `/data` automatically).
+The button reads `render.yaml` and builds the Dockerfile on Render's free plan (512 MB, 0.1 CPU). On that plan the service sleeps after 15 minutes without traffic, the first visit afterwards takes about a minute, and each analysis is slow because of the small CPU share.
 
-Load testing: `locust -f tests/load/locustfile.py --host https://<user>-<space>.hf.space` (it requests rule-based tips only, so it doesn't spend API credits).
+The app works without any API key, using rule-based tips. To have Claude write them, add `ANTHROPIC_API_KEY` under *Environment* in Render; API usage is billed by Anthropic.
+
+Load testing: `locust -f tests/load/locustfile.py --host https://<your-app>.onrender.com` (it requests rule-based tips only, so it doesn't spend API credits).
 
 ## Limits
 

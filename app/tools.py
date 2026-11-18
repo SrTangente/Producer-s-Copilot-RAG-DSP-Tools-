@@ -1,4 +1,11 @@
-"""DSP analysis of a mix or master: tempo, key, loudness, dynamics, tone, stereo."""
+"""DSP analysis of a mix or master: loudness, peaks, dynamics, tone, stereo,
+tempo and key.
+
+The file is read once, block by block, and every measurement keeps only a small
+running state, so memory use doesn't grow with the length of the track. Tempo
+and key, the only analyses that need the waveform in memory, use a low-rate
+copy of the middle two minutes. That is what lets the app run on 512 MB.
+"""
 from __future__ import annotations
 
 import os
@@ -6,12 +13,11 @@ import shutil
 import subprocess
 import tempfile
 import warnings
+from contextlib import contextmanager
 
 import numpy as np
 import soundfile as sf
-import librosa
-import pyloudnorm as pyln
-from scipy.signal import butter, resample_poly, sosfilt, welch
+from scipy.signal import butter, sosfilt, welch
 
 KEY_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
@@ -30,18 +36,37 @@ BANDS = {
     "high": (6000, 20000),
 }
 
-FEATURE_SR = 22050          # sample rate for tempo / key / spectral features
-MAX_ANALYSIS_SECONDS = 600  # ignore anything after 10 minutes
+BLOCK_FRAMES = 1 << 16       # frames decoded at a time
+MAX_ANALYSIS_SECONDS = 600   # ignore anything after 10 minutes
+FEATURE_SR = 22050           # approximate sample rate for tempo and key
+EXCERPT_SECONDS = 120        # tempo and key come from the middle of the track
+WELCH_SEGMENT = 8192
 
 
 class AudioLoadError(ValueError):
     """The file could not be decoded as audio."""
 
 
+def _dbfs(x: float) -> float:
+    return float(20.0 * np.log10(max(float(x), 1e-12)))
+
+
+def _to_lufs(power):
+    with np.errstate(divide="ignore"):
+        return -0.691 + 10.0 * np.log10(power)
+
+
 # --- Loading ---------------------------------------------------------------
 
-def _decode_with_ffmpeg(path: str) -> tuple[np.ndarray, int]:
-    """Decode anything ffmpeg understands (m4a, aac...) via a temporary WAV."""
+@contextmanager
+def _open_audio(path: str):
+    """Yield an open SoundFile, decoding through ffmpeg if libsndfile can't."""
+    try:
+        with sf.SoundFile(path) as handle:
+            yield handle
+        return
+    except sf.LibsndfileError:
+        pass
     if not shutil.which("ffmpeg"):
         raise AudioLoadError("Unsupported audio format (ffmpeg is not installed).")
     with tempfile.TemporaryDirectory() as tmp:
@@ -49,39 +74,283 @@ def _decode_with_ffmpeg(path: str) -> tuple[np.ndarray, int]:
         proc = subprocess.run(
             ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", path, "-vn",
              "-t", str(MAX_ANALYSIS_SECONDS), "-c:a", "pcm_f32le", wav],
-            capture_output=True, timeout=120, check=False)
+            capture_output=True, timeout=300, check=False)
         if proc.returncode != 0 or not os.path.exists(wav):
             raise AudioLoadError("Could not decode audio: the file is not a supported audio format.")
-        return sf.read(wav, always_2d=False, dtype="float32")
+        with sf.SoundFile(wav) as handle:
+            yield handle
 
 
-def load_audio(path: str) -> tuple[np.ndarray, int]:
-    """Return (samples, sr) with samples shaped (n,) or (n, channels), float32."""
-    try:
-        y, sr = sf.read(path, always_2d=False, dtype="float32")
-    except Exception:  # pylint: disable=broad-except
-        # Formats libsndfile can't read (m4a, aac...) go through ffmpeg
-        y, sr = _decode_with_ffmpeg(path)
-    if y.size == 0:
-        raise AudioLoadError("The file contains no audio samples.")
-    y = y[: int(MAX_ANALYSIS_SECONDS * sr)]
-    if y.ndim == 2 and y.shape[1] > 2:
-        y = y[:, :2]  # analyse the front pair only
-    return np.ascontiguousarray(y, dtype=np.float32), int(sr)
+# --- Streaming meters --------------------------------------------------------
+
+class _BinnedSum:
+    """Sums a sample stream into fixed-length bins."""
+
+    def __init__(self, bin_size: int):
+        self.bin_size = bin_size
+        self._carry = np.empty(0)
+        self._bins: list[np.ndarray] = []
+
+    def add(self, values: np.ndarray) -> None:
+        buf = np.concatenate([self._carry, values])
+        full = len(buf) // self.bin_size
+        if full:
+            whole = buf[:full * self.bin_size].reshape(full, self.bin_size)
+            self._bins.append(whole.sum(axis=1))
+        self._carry = buf[full * self.bin_size:]
+
+    def means(self) -> np.ndarray:
+        """Mean value per bin; a clip shorter than one bin yields one short bin."""
+        if self._bins:
+            return np.concatenate(self._bins) / self.bin_size
+        return np.array([self._carry.mean()]) if self._carry.size else np.empty(0)
 
 
-def _to_mono(y: np.ndarray) -> np.ndarray:
-    return y if y.ndim == 1 else np.mean(y, axis=1)
+def _sliding_mean(values: np.ndarray, width: int, hop: int) -> np.ndarray:
+    if values.size < width:
+        return np.array([values.mean()]) if values.size else np.empty(0)
+    cumulative = np.concatenate([[0.0], np.cumsum(values)])
+    return (cumulative[width:] - cumulative[:-width])[::hop] / width
 
 
-def _dbfs(x: float) -> float:
-    return float(20.0 * np.log10(max(float(x), 1e-12)))
+def _k_weighting_sos(sr: int) -> np.ndarray:
+    """ITU-R BS.1770 K-weighting: high shelf then high pass, as biquad sections."""
+    gain, q, fc = 4.0, 1 / np.sqrt(2), 1500.0
+    a_lin = 10 ** (gain / 40)
+    w0 = 2 * np.pi * fc / sr
+    alpha, cos_w0, root = np.sin(w0) / (2 * q), np.cos(w0), 2 * np.sqrt(a_lin)
+    shelf = np.array([
+        a_lin * ((a_lin + 1) + (a_lin - 1) * cos_w0 + root * alpha),
+        -2 * a_lin * ((a_lin - 1) + (a_lin + 1) * cos_w0),
+        a_lin * ((a_lin + 1) + (a_lin - 1) * cos_w0 - root * alpha),
+        (a_lin + 1) - (a_lin - 1) * cos_w0 + root * alpha,
+        2 * ((a_lin - 1) - (a_lin + 1) * cos_w0),
+        (a_lin + 1) - (a_lin - 1) * cos_w0 - root * alpha,
+    ])
+    w0 = 2 * np.pi * 38.0 / sr
+    alpha, cos_w0 = np.sin(w0) / (2 * 0.5), np.cos(w0)
+    high_pass = np.array([(1 + cos_w0) / 2, -(1 + cos_w0), (1 + cos_w0) / 2,
+                          1 + alpha, -2 * cos_w0, 1 - alpha])
+    return np.vstack([shelf / shelf[3], high_pass / high_pass[3]])
 
 
-# --- Individual analyses ---------------------------------------------------
+class LoudnessMeter:
+    """Integrated loudness (BS.1770-4) and loudness range (EBU Tech 3342)."""
 
-def estimate_key(y: np.ndarray, sr: int) -> tuple[str, str, float]:
+    def __init__(self, sr: int, channels: int):
+        self._sos = _k_weighting_sos(sr)
+        self._state = np.zeros((2, 2, channels))
+        self._bins = _BinnedSum(int(round(0.1 * sr)))
+
+    def add(self, block: np.ndarray) -> None:
+        weighted, self._state = sosfilt(self._sos, block, axis=0, zi=self._state)
+        self._bins.add(np.sum(weighted * weighted, axis=1))
+
+    def integrated(self) -> float:
+        power = _sliding_mean(self._bins.means(), 4, 1)  # 400 ms blocks, 75 % overlap
+        power = power[power > 0]
+        power = power[_to_lufs(power) > -70.0]
+        if power.size == 0:
+            return -70.0
+        gate = _to_lufs(np.mean(power)) - 10.0
+        power = power[_to_lufs(power) > gate]
+        return float(_to_lufs(np.mean(power))) if power.size else -70.0
+
+    def loudness_range(self) -> float:
+        bins = self._bins.means()
+        if bins.size < 30:
+            return 0.0
+        power = _sliding_mean(bins, 30, 10)  # 3 s windows every second
+        power = power[power > 0]
+        power = power[_to_lufs(power) > -70.0]
+        if power.size < 2:
+            return 0.0
+        short_term = _to_lufs(power)
+        short_term = short_term[short_term > _to_lufs(np.mean(power)) - 20.0]
+        if short_term.size < 2:
+            return 0.0
+        return float(np.percentile(short_term, 95) - np.percentile(short_term, 10))
+
+
+class TruePeakMeter:
+    """True peak by band-limited interpolation at 4x around the loudest samples.
+
+    An inter-sample peak sits next to a local maximum of the rectified signal,
+    so only those neighbourhoods need interpolating."""
+
+    HALF_WIDTH = 8
+    MARGIN_DB = 3.1  # how far below the current peak a sample can still matter
+
+    def __init__(self, channels: int):
+        h = self.HALF_WIDTH
+        self._offsets = np.arange(-h + 1, h + 1)
+        rows = []
+        for frac in (0.25, 0.5, 0.75):
+            u = frac - self._offsets
+            taper = np.i0(8.0 * np.sqrt(np.clip(1 - (u / h) ** 2, 0, 1))) / np.i0(8.0)
+            taps = np.sinc(u) * taper
+            rows.append(taps / taps.sum())
+        self._taps = np.array(rows).T
+        self._tail = np.zeros((2 * h, channels))
+        self.sample_peak = 0.0
+        self.true_peak = 0.0
+
+    def add(self, block: np.ndarray) -> None:
+        h = self.HALF_WIDTH
+        joined = np.concatenate([self._tail, block])
+        self._tail = joined[-2 * h:]
+        self.sample_peak = max(self.sample_peak, float(np.max(np.abs(block))))
+        self.true_peak = max(self.true_peak, self.sample_peak)
+        threshold = self.true_peak * 10 ** (-self.MARGIN_DB / 20)
+        for c in range(joined.shape[1]):
+            x = joined[:, c]
+            mag = np.abs(x)
+            is_peak = (mag[1:-1] >= mag[:-2]) & (mag[1:-1] >= mag[2:]) & (mag[1:-1] >= threshold)
+            peaks = np.flatnonzero(is_peak) + 1
+            # Interpolate on both sides of each peak
+            bases = np.unique(np.concatenate([peaks - 1, peaks]))
+            bases = bases[(bases >= h) & (bases < len(x) - h)]
+            if bases.size:
+                values = x[bases[:, None] + self._offsets] @ self._taps
+                self.true_peak = max(self.true_peak, float(np.max(np.abs(values))))
+
+    def finish(self) -> None:
+        self.add(np.zeros((2 * self.HALF_WIDTH, self._tail.shape[1])))
+
+
+class StereoMeter:
+    """Width (side share of energy), L/R correlation and width below 150 Hz."""
+
+    def __init__(self, sr: int):
+        self._sos = butter(4, 150, btype="lowpass", fs=sr, output="sos")
+        self._state = np.zeros((self._sos.shape[0], 2, 2))
+        self._full = np.zeros(3)  # LL, RR, LR
+        self._low = np.zeros(3)
+
+    @staticmethod
+    def _energies(y: np.ndarray) -> np.ndarray:
+        left, right = y[:, 0], y[:, 1]
+        return np.array([np.dot(left, left), np.dot(right, right), np.dot(left, right)])
+
+    def add(self, block: np.ndarray) -> None:
+        self._full += self._energies(block)
+        low, self._state = sosfilt(self._sos, block, axis=0, zi=self._state)
+        self._low += self._energies(low)
+
+    @staticmethod
+    def _width(energies: np.ndarray) -> float:
+        ll, rr, lr = energies
+        side = max((ll + rr - 2 * lr) / 4, 0.0)
+        mid = max((ll + rr + 2 * lr) / 4, 0.0)
+        return float(side / (mid + side + 1e-12))
+
+    def result(self) -> dict:
+        ll, rr, lr = self._full
+        corr = float(lr / (np.sqrt(ll * rr) + 1e-12))
+        return {"channels": 2, "stereo_width": self._width(self._full),
+                "lr_correlation": corr, "low_end_width": self._width(self._low)}
+
+
+class SpectrumMeter:
+    """Average power spectrum (non-overlapping Welch segments) of the mono mix."""
+
+    def __init__(self, sr: int):
+        self.sr = sr
+        self._carry = np.empty(0)
+        self._sum = None
+        self._segments = 0
+        self._freqs = None
+
+    def _add_segments(self, x: np.ndarray) -> None:
+        count = len(x) // WELCH_SEGMENT
+        self._freqs, power = welch(x, fs=self.sr, nperseg=WELCH_SEGMENT, noverlap=0)
+        self._sum = power * count if self._sum is None else self._sum + power * count
+        self._segments += count
+
+    def add(self, mono: np.ndarray) -> None:
+        buf = np.concatenate([self._carry, mono])
+        usable = (len(buf) // WELCH_SEGMENT) * WELCH_SEGMENT
+        if usable:
+            self._add_segments(buf[:usable])
+        self._carry = buf[usable:]
+
+    def result(self) -> dict:
+        if self._segments == 0:  # clip shorter than one segment
+            self._add_segments(np.pad(self._carry, (0, WELCH_SEGMENT - len(self._carry))))
+        freqs, power = self._freqs, self._sum / self._segments
+        audible = freqs >= 20
+        total = power[audible].sum() + 1e-30
+        bands = {}
+        for name, (lo, hi) in BANDS.items():
+            mask = (freqs >= lo) & (freqs < min(hi, self.sr / 2))
+            bands[name] = float(10 * np.log10(power[mask].sum() / total + 1e-12))
+        mag = np.sqrt(power[audible])
+        centroid = float(np.sum(freqs[audible] * mag) / (mag.sum() + 1e-30))
+        cumulative = np.cumsum(power[audible]) / total
+        rolloff = float(freqs[audible][min(np.searchsorted(cumulative, 0.85), audible.sum() - 1)])
+        return {"band_level_db": bands, "spectral_centroid_mean_hz": centroid,
+                "spectral_rolloff_hz": rolloff}
+
+
+class ExcerptCollector:
+    """Keeps a low-rate mono copy of the middle of the track."""
+
+    def __init__(self, sr: int, total_frames: int):
+        self.factor = max(1, int(round(sr / FEATURE_SR)))
+        self.sr = sr / self.factor
+        length = min(total_frames, EXCERPT_SECONDS * sr)
+        self._start = (total_frames - length) // 2
+        self._stop = self._start + length
+        self._pos = 0
+        self._phase = 0
+        self._parts: list[np.ndarray] = []
+        self._sos = None
+        if self.factor > 1:
+            self._sos = butter(8, 0.8 * self.sr / 2, fs=sr, output="sos")
+            self._state = np.zeros((self._sos.shape[0], 2))
+
+    def add(self, mono: np.ndarray) -> None:
+        begin, self._pos = self._pos, self._pos + len(mono)
+        x = mono[max(self._start - begin, 0):max(self._stop - begin, 0)]
+        if x.size == 0:
+            return
+        if self._sos is not None:
+            x, self._state = sosfilt(self._sos, x, zi=self._state)
+        self._parts.append(x[self._phase::self.factor].astype(np.float32))
+        self._phase = (self._phase - len(x)) % self.factor
+
+    def result(self) -> np.ndarray:
+        return np.concatenate(self._parts) if self._parts else np.empty(0, dtype=np.float32)
+
+
+# --- Tempo and key -----------------------------------------------------------
+
+def estimate_bpm(y: np.ndarray, sr: float) -> float:
+    """Tempo from librosa's beat tracker, refined with a fit over the beat times."""
+    import librosa  # pylint: disable=import-outside-toplevel  # heavy: load on first use
+
+    if y.size == 0 or not np.any(y):
+        return 0.0
+    hop = 512
+    tempo, beats = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop, trim=False)
+    coarse = float(np.atleast_1d(tempo)[0])
+    if len(beats) < 4:
+        return coarse
+    # The tempogram estimate is quantised; a least-squares fit of beat times
+    # against beat index averages out the frame-grid jitter.
+    times = librosa.frames_to_time(beats, sr=sr, hop_length=hop)
+    period = np.polyfit(np.arange(len(times)), times, 1)[0]
+    refined = 60.0 / period if period > 0 else coarse
+    # Only trust the refinement when it agrees with the coarse estimate
+    return float(refined if abs(refined - coarse) / coarse < 0.08 else coarse)
+
+
+def estimate_key(y: np.ndarray, sr: float) -> tuple[str, str, float]:
     """Return (key_name, mode, confidence in [0, 1])."""
+    import librosa  # pylint: disable=import-outside-toplevel
+
+    if y.size == 0 or not np.any(y):
+        return "C", "major", 0.0
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr).mean(axis=1)
     if chroma.sum() <= 0:
         return "C", "major", 0.0
@@ -102,188 +371,26 @@ def estimate_key(y: np.ndarray, sr: int) -> tuple[str, str, float]:
     return KEY_NAMES[best_i], best_mode, confidence
 
 
-def estimate_bpm(y: np.ndarray, sr: int) -> float:
-    hop = 512
-    tempo, beats = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop, trim=False)
-    coarse = float(np.atleast_1d(tempo)[0])
-    if len(beats) < 4:
-        return coarse
-    # The tempogram estimate is quantised; a least-squares fit of beat times
-    # against beat index averages out the frame-grid jitter.
-    times = librosa.frames_to_time(beats, sr=sr, hop_length=hop)
-    period = np.polyfit(np.arange(len(times)), times, 1)[0]
-    refined = 60.0 / period if period > 0 else coarse
-    # Only trust the refinement when it agrees with the coarse estimate
-    return float(refined if abs(refined - coarse) / coarse < 0.08 else coarse)
-
-
-def _k_weighted_block_power(y: np.ndarray, sr: int, block_s: float, hop_s: float) -> np.ndarray:
-    """Mean-square power of K-weighted audio per block, summed over channels
-    (BS.1770 channel weights are 1.0 for L and R)."""
-    meter = pyln.Meter(sr)  # used only for its K-weighting filter coefficients
-    chans = [y] if y.ndim == 1 else [y[:, c] for c in range(y.shape[1])]
-    block, hop = int(round(block_s * sr)), int(round(hop_s * sr))
-    n = len(chans[0])
-    if n < block:
-        block = n
-    starts = np.arange(0, n - block + 1, hop)
-    total = np.zeros(len(starts))
-    for ch in chans:
-        x = ch.astype(np.float64)
-        for filt in meter._filters.values():  # pylint: disable=protected-access
-            x = filt.apply_filter(x)
-        # Sliding mean of x^2 via cumulative sums: one pass for every block
-        csum = np.concatenate([[0.0], np.cumsum(x * x)])
-        total += (csum[starts + block] - csum[starts]) / block
-    return total
-
-
-def _to_lufs(power: np.ndarray) -> np.ndarray:
-    with np.errstate(divide="ignore"):
-        return -0.691 + 10.0 * np.log10(power)
-
-
-def integrated_loudness(y: np.ndarray, sr: int) -> float:
-    """ITU-R BS.1770-4 integrated loudness: 400 ms blocks, 75 % overlap,
-    absolute gate at -70 LUFS and relative gate at -10 LU."""
-    power = _k_weighted_block_power(y, sr, 0.4, 0.1)
-    loud = _to_lufs(power)
-    power = power[loud > -70.0]
-    if power.size == 0:
-        return -70.0
-    rel_gate = _to_lufs(np.mean(power)) - 10.0
-    power = power[_to_lufs(power) > rel_gate]
-    return float(_to_lufs(np.mean(power))) if power.size else -70.0
-
+# --- Main API --------------------------------------------------------------
 
 def loudness_range(y: np.ndarray, sr: int) -> float:
-    """EBU Tech 3342 loudness range (LU): spread between the 10th and 95th
-    percentile of 3 s short-term loudness, gated at -70 LUFS and -20 LU."""
-    if y.shape[0] < 3 * sr:
-        return 0.0
-    st = _to_lufs(_k_weighted_block_power(y, sr, 3.0, 1.0))
-    st = st[np.isfinite(st) & (st > -70.0)]
-    if st.size < 2:
-        return 0.0
-    rel_gate = _to_lufs(np.mean(10 ** ((st + 0.691) / 10))) - 20.0
-    st = st[st > rel_gate]
-    if st.size < 2:
-        return 0.0
-    return float(np.percentile(st, 95) - np.percentile(st, 10))
+    """Loudness range (LU) of an in-memory signal."""
+    samples = y.reshape(len(y), -1).astype(np.float64)
+    meter = LoudnessMeter(sr, samples.shape[1])
+    meter.add(samples)
+    return meter.loudness_range()
 
 
-def true_peak(y: np.ndarray, oversample: int = 4, block: int = 8192) -> float:
-    """Approximate true peak (linear) with 4x polyphase oversampling.
+def _dynamics(mono_peak: float, mono_energy: float, frames: int, rms_bins: np.ndarray) -> dict:
+    rms = np.sqrt(mono_energy / max(frames, 1))
+    spread = 0.0
+    if rms_bins.size >= 8:
+        levels = 10 * np.log10(np.maximum(_sliding_mean(rms_bins, 4, 2), 1e-12))
+        levels = levels[levels > -60]
+        if levels.size:
+            spread = float(np.percentile(levels, 95) - np.percentile(levels, 10))
+    return {"crest_factor_db": _dbfs(mono_peak) - _dbfs(rms), "rms_spread_db": spread}
 
-    Only blocks whose sample peak is within 3 dB of the file's sample peak can
-    hold the true peak, so only those are oversampled."""
-    y2 = y.reshape(len(y), -1)
-    sample_peak = float(np.max(np.abs(y2)))
-    if sample_peak == 0:
-        return 0.0
-    n = len(y2)
-    n_blocks = int(np.ceil(n / block))
-    padded = np.zeros((n_blocks * block, y2.shape[1]), dtype=np.float32)
-    padded[:n] = y2
-    block_peaks = np.abs(padded).reshape(n_blocks, block, -1).max(axis=(1, 2))
-    best = sample_peak
-    margin = 64  # samples of context so the filter sees the waveform around the peak
-    for b in np.nonzero(block_peaks >= sample_peak * 10 ** (-3 / 20))[0]:
-        lo, hi = max(0, b * block - margin), min(n, (b + 1) * block + margin)
-        seg = resample_poly(y2[lo:hi].astype(np.float64), oversample, 1, axis=0)
-        # Drop the filter's edge transients: keep only the block itself
-        start = (b * block - lo) * oversample
-        stop = start + (min(n, (b + 1) * block) - b * block) * oversample
-        best = max(best, float(np.max(np.abs(seg[start:stop]))))
-    return best
-
-
-def analyze_loudness(y: np.ndarray, sr: int) -> dict:
-    """Integrated loudness, LRA, true peak, sample peak, PLR, clipping."""
-    lufs_i = integrated_loudness(y, sr)
-    lra = loudness_range(y, sr)
-    sample_peak = float(np.max(np.abs(y)))
-    true_peak_dbfs = _dbfs(true_peak(y))
-    clipped = int(np.sum(np.abs(y) >= 0.999))
-    return {
-        "lufs_i": lufs_i,
-        "lra": lra,
-        "true_peak_dbfs": true_peak_dbfs,
-        "sample_peak_dbfs": _dbfs(sample_peak),
-        "plr_db": true_peak_dbfs - lufs_i,  # peak-to-loudness ratio
-        "clipped_samples": clipped,
-    }
-
-
-def analyze_dynamics(y_mono: np.ndarray, sr: int) -> dict:
-    """Crest factor and RMS spread over 400 ms windows."""
-    peak = np.max(np.abs(y_mono))
-    rms = np.sqrt(np.mean(y_mono ** 2))
-    crest_db = _dbfs(peak) - _dbfs(rms)
-    frame = int(0.4 * sr)
-    if len(y_mono) >= frame * 2:
-        rms_frames = librosa.feature.rms(y=y_mono, frame_length=frame, hop_length=frame // 2)[0]
-        rms_db = 20 * np.log10(np.maximum(rms_frames, 1e-6))
-        rms_db = rms_db[rms_db > -60]
-        spread = float(np.percentile(rms_db, 95) - np.percentile(rms_db, 10)) if rms_db.size else 0.0
-    else:
-        spread = 0.0
-    return {"crest_factor_db": float(crest_db), "rms_spread_db": spread}
-
-
-def analyze_tonal_balance(y_mono: np.ndarray, sr: int) -> dict:
-    """Level of each frequency band relative to the whole spectrum (dB),
-    plus spectral centroid and 85 % rolloff.
-
-    Band levels are 10*log10(band power / total power): the low bands are
-    near 0 dB and the top bands well below, as in any real mix. They are
-    meant to be compared with a reference, not read in isolation."""
-    # Welch PSD: averaged spectrum, memory-light even for long files
-    freqs, power = welch(y_mono.astype(np.float64), fs=sr, nperseg=8192)
-    audible = freqs >= 20
-    total = power[audible].sum() + 1e-30
-    bands = {}
-    for name, (lo, hi) in BANDS.items():
-        mask = (freqs >= lo) & (freqs < min(hi, sr / 2))
-        bands[name] = float(10 * np.log10(power[mask].sum() / total + 1e-12))
-    # Centroid of the magnitude spectrum (matches librosa's definition)
-    mag = np.sqrt(power[audible])
-    centroid = float(np.sum(freqs[audible] * mag) / (mag.sum() + 1e-30))
-    cumulative = np.cumsum(power[audible]) / total
-    rolloff = float(freqs[audible][min(np.searchsorted(cumulative, 0.85), audible.sum() - 1)])
-    return {
-        "band_level_db": bands,
-        "spectral_centroid_mean_hz": centroid,
-        "spectral_rolloff_hz": rolloff,
-    }
-
-
-def _width_and_corr(left: np.ndarray, right: np.ndarray) -> tuple[float, float]:
-    mid, side = (left + right) / 2, (left - right) / 2
-    e_mid, e_side = np.sum(mid ** 2), np.sum(side ** 2)
-    width = float(e_side / (e_mid + e_side + 1e-12))
-    denom = np.sqrt(np.sum(left ** 2) * np.sum(right ** 2)) + 1e-12
-    return width, float(np.sum(left * right) / denom)
-
-
-def analyze_stereo(y: np.ndarray, sr: int) -> dict:
-    """Stereo width (side share of energy, 0 = mono, 1 = pure side), L/R
-    correlation, and the width below 150 Hz (bass should usually be mono)."""
-    if y.ndim == 1:
-        return {"channels": 1, "stereo_width": 0.0, "lr_correlation": 1.0, "low_end_width": 0.0}
-    left, right = y[:, 0].astype(np.float64), y[:, 1].astype(np.float64)
-    width, corr = _width_and_corr(left, right)
-    # Low end: decimate to ~3 kHz first (cheap), then low-pass at 150 Hz.
-    # The same filter on both channels keeps their phase relationship intact.
-    factor = max(1, sr // 3000)
-    low = resample_poly(y.astype(np.float64), 1, factor, axis=0) if factor > 1 else y.astype(np.float64)
-    sos = butter(4, 150, btype="lowpass", fs=sr / factor, output="sos")
-    low = sosfilt(sos, low, axis=0)
-    low_width, _ = _width_and_corr(low[:, 0], low[:, 1])
-    return {"channels": 2, "stereo_width": width, "lr_correlation": corr, "low_end_width": low_width}
-
-
-# --- Main API --------------------------------------------------------------
 
 def analyze_audio(path: str) -> dict:
     """Analyze an audio file and return a flat-ish dict of metrics.
@@ -294,30 +401,69 @@ def analyze_audio(path: str) -> dict:
     spectral_centroid_mean_hz, spectral_rolloff_hz, channels, stereo_width,
     lr_correlation, low_end_width.
     """
+    with _open_audio(path) as audio:
+        sr, channels = audio.samplerate, min(audio.channels, 2)
+        limit = int(MAX_ANALYSIS_SECONDS * sr)
+        total = min(audio.frames, limit)
+        if total <= 0:
+            raise AudioLoadError("The file contains no audio samples.")
+
+        loudness = LoudnessMeter(sr, channels)
+        peaks = TruePeakMeter(channels)
+        stereo = StereoMeter(sr) if channels == 2 else None
+        spectrum = SpectrumMeter(sr)
+        excerpt = ExcerptCollector(sr, total)
+        rms_bins = _BinnedSum(int(round(0.1 * sr)))
+        frames, clipped, mono_peak, mono_energy = 0, 0, 0.0, 0.0
+
+        while frames < limit:
+            try:
+                raw = audio.read(min(BLOCK_FRAMES, limit - frames), dtype="float64", always_2d=True)
+            except (sf.LibsndfileError, RuntimeError) as exc:
+                raise AudioLoadError(f"Could not decode audio: {exc}") from exc
+            if len(raw) == 0:
+                break
+            block = raw[:, :channels]
+            frames += len(block)
+            mono = block.mean(axis=1)
+            squared = mono * mono
+
+            loudness.add(block)
+            peaks.add(block)
+            spectrum.add(mono)
+            excerpt.add(mono)
+            rms_bins.add(squared)
+            if stereo:
+                stereo.add(block)
+            clipped += int(np.count_nonzero(np.abs(block) >= 0.999))
+            mono_peak = max(mono_peak, float(np.max(np.abs(mono))))
+            mono_energy += float(squared.sum())
+
+    if frames == 0:
+        raise AudioLoadError("The file contains no audio samples.")
+    peaks.finish()
+
+    true_peak_dbfs = _dbfs(peaks.true_peak)
+    lufs_i = loudness.integrated()
+    metrics: dict = {
+        "sr": int(sr),
+        "duration_s": frames / sr,
+        "lufs_i": lufs_i,
+        "lra": loudness.loudness_range(),
+        "true_peak_dbfs": true_peak_dbfs,
+        "sample_peak_dbfs": _dbfs(peaks.sample_peak),
+        "plr_db": true_peak_dbfs - lufs_i,  # peak-to-loudness ratio
+        "clipped_samples": clipped,
+    }
+    metrics.update(stereo.result() if stereo else
+                   {"channels": 1, "stereo_width": 0.0, "lr_correlation": 1.0, "low_end_width": 0.0})
+    metrics.update(_dynamics(mono_peak, mono_energy, frames, rms_bins.means()))
+    metrics.update(spectrum.result())
+
+    features = excerpt.result()
     with warnings.catch_warnings():
-        # librosa is chatty about short or tonal-less clips
-        warnings.simplefilter("ignore", UserWarning)
-        return _analyze(path)
-
-
-def _analyze(path: str) -> dict:
-    y, sr = load_audio(path)
-    y_mono = _to_mono(y)
-    duration_s = float(len(y_mono) / sr)
-
-    # Loudness and stereo at the native sample rate
-    metrics: dict = {"sr": sr, "duration_s": duration_s}
-    metrics.update(analyze_loudness(y, sr))
-    metrics.update(analyze_stereo(y, sr))
-
-    # Musical features at ~22 kHz: integer decimation is much cheaper than
-    # arbitrary-ratio resampling and keeps everything that matters below 11 kHz
-    factor = max(1, int(round(sr / FEATURE_SR)))
-    feat_sr = sr // factor
-    y_feat = resample_poly(y_mono, 1, factor).astype(np.float32) if factor > 1 else y_mono
-    metrics["bpm"] = estimate_bpm(y_feat, feat_sr)
-    key, mode, conf = estimate_key(y_feat, feat_sr)
-    metrics.update({"key": key, "mode": mode, "key_confidence": conf})
-    metrics.update(analyze_dynamics(y_mono, sr))
-    metrics.update(analyze_tonal_balance(y_mono, sr))
+        warnings.simplefilter("ignore", UserWarning)  # librosa warns on short clips
+        metrics["bpm"] = estimate_bpm(features, excerpt.sr)
+        key, mode, confidence = estimate_key(features, excerpt.sr)
+    metrics.update({"key": key, "mode": mode, "key_confidence": confidence})
     return metrics

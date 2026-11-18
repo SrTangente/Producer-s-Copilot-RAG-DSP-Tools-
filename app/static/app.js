@@ -7,24 +7,25 @@ const el = (tag, props = {}, ...children) => {
   return node;
 };
 
-// --- Workspace id: scopes the reference library to this browser ----------
-function workspaceId() {
-  let id = null;
-  try { id = localStorage.getItem("copilot.workspace"); } catch (_) { /* storage blocked */ }
-  if (!id || !/^[A-Za-z0-9_-]{8,64}$/.test(id)) {
-    id = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now()).replace(/[^A-Za-z0-9]/g, "");
-    try { localStorage.setItem("copilot.workspace", id); } catch (_) { /* keep it in memory */ }
-  }
-  return id;
-}
-const WS = workspaceId();
-
 async function api(path, opts = {}) {
-  const res = await fetch(path, { ...opts, headers: { "X-Workspace": WS, ...(opts.headers || {}) } });
+  const res = await fetch(path, opts);
   let body = null;
   try { body = await res.json(); } catch (_) { /* non-JSON error */ }
   if (!res.ok) throw new Error((body && body.detail) || `Request failed (${res.status})`);
   return body;
+}
+
+// --- Reference library: kept in this browser, so it survives server restarts ---
+const REF_KEY = "copilot.references";
+const MAX_REFERENCES = 20;
+function readReferences() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(REF_KEY) || "[]");
+    return Array.isArray(saved) ? saved.filter((r) => r && r.id && r.metrics) : [];
+  } catch (_) { return []; }
+}
+function saveReferences() {
+  try { localStorage.setItem(REF_KEY, JSON.stringify(state.references)); } catch (_) { /* kept for this visit */ }
 }
 
 const state = { file: null, targets: [], references: [], llm: false };
@@ -98,9 +99,10 @@ function renderReferences() {
     const m = r.metrics;
     const del = el("button", { type: "button", title: `Remove ${r.name}`, textContent: "×" });
     del.setAttribute("aria-label", `Remove ${r.name}`);
-    del.onclick = async () => {
-      try { await api(`/references/${r.id}`, { method: "DELETE" }); await loadReferences(); }
-      catch (err) { setStatus(err.message, true); }
+    del.onclick = () => {
+      state.references = state.references.filter((x) => x.id !== r.id);
+      saveReferences();
+      renderReferences();
     };
     return el("li", {},
       el("div", {}, el("div", { textContent: r.name }),
@@ -109,25 +111,23 @@ function renderReferences() {
   }));
 }
 
-async function loadReferences() {
-  state.references = (await api("/references")).references;
-  renderReferences();
-}
-
 $("#ref-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const file = $("#ref-file").files[0];
   if (!file) return;
   const btn = e.submitter || $("#ref-form button");
   btn.disabled = true;
-  setStatus("Analyzing reference…", false, true);
+  setStatus("Analyzing reference… this can take a minute or two.", false, true);
   const fd = new FormData();
   fd.append("file", file);
-  fd.append("name", $("#ref-name").value);
+  const name = $("#ref-name").value.trim() || file.name.replace(/\.[^.]+$/, "");
   try {
-    const ref = await api("/references", { method: "POST", body: fd });
+    const metrics = await api("/analyze", { method: "POST", body: fd });
+    const ref = { id: `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`, name: name.slice(0, 120), metrics };
+    state.references = [ref, ...state.references].slice(0, MAX_REFERENCES);
+    saveReferences();
     $("#ref-form").reset();
-    await loadReferences();
+    renderReferences();
     $("#reference-select").value = ref.id;
     document.querySelector('input[name="refmode"][value="reference"]').checked = true;
     syncRefMode();
@@ -154,12 +154,14 @@ go.addEventListener("click", async () => {
   if (mode === "reference") {
     const id = $("#reference-select").value;
     if (!id) { setStatus("Add a reference track first, or pick another option.", true); return; }
-    fd.append("reference_id", id);
+    const ref = state.references.find((r) => r.id === id);
+    fd.append("reference_json", JSON.stringify(ref.metrics));
+    fd.append("reference_name", ref.name);
   }
   const useLlm = state.llm && $("#use-llm").checked;
   fd.append("use_llm", useLlm ? "true" : "false");
   go.disabled = true;
-  setStatus(useLlm ? "Analyzing and writing tips… (up to a minute)" : "Analyzing… (a few seconds per minute of audio)", false, true);
+  setStatus(useLlm ? "Analyzing and writing tips… this can take a few minutes." : "Analyzing… this can take a minute or two on the free server.", false, true);
   try {
     const result = await api("/tips", { method: "POST", body: fd });
     renderResults(result, state.file.name);
@@ -298,7 +300,8 @@ function renderResults(r, fileName) {
     $("#llm-row").hidden = !state.llm;
     state.targets = targets.targets;
     renderTargets();
-    await loadReferences();
+    state.references = readReferences();
+    renderReferences();
   } catch (err) {
     setStatus(`Could not reach the server: ${err.message}`, true);
   }
